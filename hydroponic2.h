@@ -20,7 +20,7 @@
 #define MSG_ERROR        2
 #define MSG_SENSOR       3
 
-#define TEMPERATURE_PRECISION 9
+#define TEMPERATURE_PRECISION 10
 
 #define SERIAL_ONLY      true
 
@@ -53,6 +53,9 @@ const int EEPROM_NUTRIENT_TIMER = 27;
 const int EEPROM_NUTRIENT_CALIBRATION = 29;
 const int EEPROM_LOG_INTERVAL = 30;
 const int EEPROM_DRAIN_TIME = 31;
+const int EEPROM_TEMP_CABINET = 40;
+const int EEPROM_TEMP_OUTSIDE = 48;
+const int EEPROM_TEMP_RESERVOIR = 56;
 const int MAX_WATER_TIMERS = 9;
 
 #ifdef ADRUINO_MEGA
@@ -70,9 +73,9 @@ const int MAX_WATER_TIMERS = 9;
   
   const int PIN_BACKLIGHT = 26;    // Push button to activate the backlight of the display
   const int PIN_ERRORRESET = 27;   // Push button to reset error state to idle
-  const int PIN_EJECTSD = 28;      // Push button to disable SD card
+  const int PIN_SDEJECT = 28;      // Push button to disable SD card
   
-  const int PIN_ONEWIRE = 69;
+  const int PIN_ONEWIRE = 2;
   const int PIN_CHIP_SELECT = 53;
 #else
   const int PIN_IRRIGATION = 3;

@@ -5,18 +5,18 @@
   for operating a Dutch Bucket hydroponic system.
 
   The circuit:
-  * list the components attached to each input
-  * list the components attached to each output
+    list the components attached to each input
+    list the components attached to each output
 
   Created 01.07.2016
   Stefan Demmer (semmel)
-  
+
   Modified day month year
   By author's name
 
   this is a test
   this is a new test
-  
+
 
   http://
 
@@ -24,7 +24,7 @@
 
 #define SDCARD 1
 //#define LCD    1
-//#define DALLAS 1
+#define DALLAS 1
 #define ADRUINO_MEGA 1
 
 #include <Time.h>
@@ -37,6 +37,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <Bounce2.h>
 #include "hydroponic2.h"
 
 
@@ -46,6 +47,7 @@ RBD::SerialManager serial_manager;
 SdFat sd;
 SdFile myFile;
 char logFileName[15];
+byte sdEnabled = true;
 #endif
 
 #ifdef LCD
@@ -59,11 +61,18 @@ byte backlightIsOn = BACKLIGHT_ON_TIME;
 OneWire oneWire(PIN_ONEWIRE);
 // Pass our oneWire reference to Dallas Temperature.
 DallasTemperature sensors(&oneWire);
-// arrays to hold device addresses
-DeviceAddress  tempCabinet = { 0x28, 0x1D, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
+// arrays to hold device addresses28 FF AD B5 64 14 1 35
+DeviceAddress  tempCabinet = { 0x28, 0xFF, 0xAD, 0xB5, 0x64, 0x14, 0x1, 0x35 }; // real adress!!!
 DeviceAddress  tempOutside = { 0x28, 0x3F, 0x1C, 0x31, 0x2, 0x0, 0x0, 0x2 };
 DeviceAddress  tempReservoir = { 0x28, 0x1A, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
 #endif
+
+
+
+// Instantiate a Bounce objects for push buttons
+Bounce debounceBackLight = Bounce();
+Bounce debounceErrorReset = Bounce();
+Bounce debounceSdEject = Bounce();
 
 float tempCabinetValue;
 float tempOutsideValue;
@@ -80,6 +89,20 @@ char msgBuffer[40];
 unsigned long timer1s;
 byte sdLogIntervall = 0;
 
+void readOwArdessesFromEeprom(uint8_t* myDeviceAddress, int eepromStartAddress) {
+  printOwAddress(tempCabinet);
+  Serial.println("");
+  printOwAddress(tempOutside);
+  Serial.println("");
+  printOwAddress(tempReservoir);
+  Serial.println("");
+  for (int i = eepromStartAddress; i < (eepromStartAddress + 8); i++) {
+    Serial.println(myDeviceAddress[i], HEX);
+    myDeviceAddress[i] = EEPROM.read(eepromStartAddress + i);
+    Serial.println(myDeviceAddress[i], HEX);
+  }
+}
+
 void setup() {
   timeStatus_t myTimeStatus;
   // Start serial manager for serial command processing
@@ -89,14 +112,14 @@ void setup() {
 #ifdef SDCARD
   if (!sd.begin(PIN_CHIP_SELECT, SPI_HALF_SPEED)) {
     sd.initErrorPrint();
+    sdEnabled = false;
   }
+  setLogFileName();
 #endif
 
   // sync with RTC
   setSyncProvider(RTC.get);   // the function to get the time from the RTC
   setSyncInterval(120);
-
-  setLogFileName();
 
   if (timeStatus() != timeSet) {
     setTime(0, 0, 0, 1, 1, 2016);
@@ -112,6 +135,12 @@ void setup() {
   pinMode(PIN_NUTRIENT_1, OUTPUT);
   pinMode(PIN_NUTRIENT_2, OUTPUT);
   pinMode(PIN_REFILL_VALVE, OUTPUT);
+
+  digitalWrite(PIN_IRRIGATION, LOW);
+  digitalWrite(PIN_NUTRIENT_1, LOW);
+  digitalWrite(PIN_NUTRIENT_2, LOW);
+  digitalWrite(PIN_REFILL_VALVE, LOW);
+
   pinMode(PIN_HW_RESET, OUTPUT);
   digitalWrite(PIN_HW_RESET, HIGH);
 
@@ -120,15 +149,20 @@ void setup() {
   pinMode(PIN_RESERVOIR_FULL, INPUT_PULLUP);
   pinMode(PIN_RESERVOIR_VERY_FULL, INPUT_PULLUP);
 
+  // Cunfigure inputs for various push buttons
   pinMode(PIN_BACKLIGHT, INPUT_PULLUP);
   pinMode(PIN_ERRORRESET, INPUT_PULLUP);
-  pinMode(PIN_EJECTSD, INPUT_PULLUP);
+  pinMode(PIN_SDEJECT, INPUT_PULLUP);
 
-  digitalWrite(PIN_IRRIGATION, LOW);
-  digitalWrite(PIN_NUTRIENT_1, LOW);
-  digitalWrite(PIN_NUTRIENT_2, LOW);
-  digitalWrite(PIN_REFILL_VALVE, LOW);
+  // After setting up the button, setup the Bounce instance :
+  debounceBackLight.attach(PIN_BACKLIGHT);
+  debounceBackLight.interval(10); // interval in ms
+  debounceErrorReset.attach(PIN_ERRORRESET);
+  debounceErrorReset.interval(10); // interval in ms
+  debounceSdEject.attach(PIN_SDEJECT);
+  debounceSdEject.interval(10); // interval in ms
 
+  // Configure input for water flow sensor and attache interrupt
   pinMode(PIN_REFILL_SENSOR, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_REFILL_SENSOR), interruptRoutineFloatSensorCounter, RISING);
   logEvent_P(PSTR("Setting pin modes done."), MSG_INFO);
@@ -138,6 +172,10 @@ void setup() {
   if (sdLogIntervall < 1 or sdLogIntervall > 30) {
     sdLogIntervall = 5;
   }
+  tempCabinet[0] = 33;
+  readOwArdessesFromEeprom(tempCabinet, EEPROM_TEMP_CABINET);
+  readOwArdessesFromEeprom(tempOutside, EEPROM_TEMP_OUTSIDE);
+  readOwArdessesFromEeprom(tempReservoir, EEPROM_TEMP_RESERVOIR);
 
 #ifdef DALLAS
   // Start up the library for the Temperature Sensors
@@ -353,14 +391,21 @@ void loop() {
 
   // execute every second
   if (millis() - timer1s >= 1000) {
-
-    /*tempCabinetValue = sensors.getTempC(tempCabinet);
-      tempOutsideValue = sensors.getTempC(tempOutside);
-      tempReservoirValue = sensors.getTempC(tempReservoir);
+    timer1s = millis();
+    sensors.requestTemperatures();
+    //if (sensors.isConnected(tempCabinet)) {
+    tempCabinetValue = sensors.getTempC(tempCabinet);
+    /*    }
+        else {
+          logEvent_P(PSTR("Cabinet Sensor not found."), MSG_ERROR);
+        }
     */
-    tempCabinetValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
-    tempOutsideValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
-    tempReservoirValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
+    tempOutsideValue = sensors.getTempC(tempOutside);
+    tempReservoirValue = sensors.getTempC(tempReservoir);
+
+    //tempCabinetValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
+    //tempOutsideValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
+    // tempReservoirValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
 
 #ifdef LCD
     // Switch LCD backlight off after BACKLIGHT_ON_TIME seconds
@@ -404,8 +449,8 @@ void loop() {
       strcat(msgBuffer, "\t");
       dtostrf(6.4F, 0, 1, &msgBuffer[strlen(msgBuffer)]);
       logEvent(msgBuffer, MSG_SENSOR);
-      sprintf_P(msgBuffer, PSTR("Free RAM: %d byte."), freeRam());
-      logEvent(msgBuffer, MSG_INFO);
+      //sprintf_P(msgBuffer, PSTR("Free RAM: %d byte."), freeRam());
+      //logEvent(msgBuffer, MSG_INFO);
     }
   }
 
@@ -448,7 +493,7 @@ void readWaterTimers() {
     byte myDuration =  EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 2);
     if (myHour >= 0 && myHour <= 23 &&
         myMinute >= 0 && myMinute <= 59 &&
-        myDuration > 0 && myDuration < 255) {
+        myDuration > 0 && myDuration <= 255) {
       irrigationAlarms[i].startTime = myHour * 60 + myMinute;
       irrigationAlarms[i].endTime = myHour * 60 + myMinute + myDuration;
       irrigationAlarms[i].duration = myDuration;
@@ -475,6 +520,9 @@ void CheckSerialManager() {
         }
         if (value == "cat" || value == "CAT") {
           printHelp_loginterval();
+        }
+        if (value == "cfgtmp" || value == "CFGTMP") {
+          printHelp_cfgtmp();
         }
         if (value == "date" || value == "DATE") {
           printHelp_date();
@@ -712,10 +760,12 @@ void CheckSerialManager() {
     }
 #endif
 
-
+    // *** LIST **********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("list")) {
       eeprom_serial_dump_table(10);
     }
+
+    // *** REFILL **********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("refill")) {
       doManualRefill = true;
       logEvent_P(PSTR("Manual refill triggered."), MSG_WARNING);
@@ -797,8 +847,142 @@ void CheckSerialManager() {
         logParameters(LOG_NUTRIENTS, SERIAL_ONLY);
       }
     }
+
+#ifdef SDCARD
+    // *** CFGTMP **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("sdeject") || serial_manager.isCmd("SDEJECT")) {
+      sdEnabled = false;
+      logEvent_P(PSTR("SD card can now be removed safely."), MSG_WARNING);
+      // light LED
+    }
+
+    // *** CFGTMP **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("sdinit") || serial_manager.isCmd("SDINIT")) {
+      if (!sd.begin(PIN_CHIP_SELECT, SPI_HALF_SPEED)) {
+        sd.initErrorPrint();
+        sdEnabled = true;
+      }
+      setLogFileName();
+      logEvent_P(PSTR("SD card has been re-initialised."), MSG_INFO);
+      //switch off led
+    }
+#endif
+
+    // *** CFGTMP **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("cfgtmp") || serial_manager.isCmd("CFGTMP")) {
+      if (serial_manager.getParam().length() > 0) {
+        int channel = -1;
+        char buf[50];
+        serial_manager.getParam().toCharArray(buf, 50);
+        channel = (char)buf[0] - '0'; //value.substring(0, 1).toInt();
+
+        switch (channel) {
+          case 0:
+            for (int i = 0; i < 8; i++) {
+              int n;
+              n = (hexToByte(buf[2 + i * 3]) * 16) + hexToByte(buf[2 + i * 3 + 1]);
+              EEPROM.write(EEPROM_TEMP_CABINET + i, n);
+              tempCabinet[i] = n;
+            }
+            logEvent_P(PSTR("OW Sensor adress changed for sensor CABINET."), MSG_INFO);
+            break;
+          case 1:
+            for (int i = 0; i < 8; i++) {
+              int n;
+              n = (hexToByte(buf[2 + i * 3]) * 16) + hexToByte(buf[2 + i * 3 + 1]);
+              EEPROM.write(EEPROM_TEMP_OUTSIDE + i, n);
+              tempOutside[i] = n;
+            }
+            logEvent_P(PSTR("OW Sensor adress changed for sensor OUTSIDE."), MSG_INFO);
+            break;
+          case 2:
+            for (int i = 0; i < 8; i++) {
+              int n;
+              n = (hexToByte(buf[2 + i * 3]) * 16) + hexToByte(buf[2 + i * 3 + 1]);
+              EEPROM.write(EEPROM_TEMP_RESERVOIR + i, n);
+              tempReservoir[i] = n;
+            }
+            logEvent_P(PSTR("OW Sensor adress changed for sensor RESERVOIR."), MSG_INFO);
+            break;
+          default:
+            break;
+        }
+      } else {
+        printHelp_cfgtmp();
+        // print configured sensor adresses + status
+        Serial.print(F("Sensor Cabinet (ID: 0)  : "));
+        printOwAddress(tempCabinet);
+        if (sensors.isConnected(tempCabinet)) {
+          Serial.print(F(" OK"));
+        } else {
+          Serial.print(F(" NOT CONNECTED"));
+        }
+        Serial.println("");
+
+        Serial.print(F("Sensor Outside (ID: 1)  : "));
+        printOwAddress(tempOutside);
+        if (sensors.isConnected(tempOutside)) {
+          Serial.print(F(" OK"));
+        } else {
+          Serial.print(F(" NOT CONNECTED"));
+        }
+        Serial.println("");
+
+        Serial.print(F("Sensor Reservoir (ID: 2): "));
+        printOwAddress(tempReservoir);
+        if (sensors.isConnected(tempReservoir)) {
+          Serial.print(F(" OK"));
+        } else {
+          Serial.print(F(" NOT CONNECTED"));
+        }
+        Serial.println("");
+        Serial.println("");
+        // search for sensors
+
+        uint8_t address[8];
+        uint8_t count = 0;
+
+        if (oneWire.search(address)) {
+          if (memcmp(address, tempCabinet, 8) != 0 && memcmp(address, tempOutside, 8) != 0 && memcmp(address, tempReservoir, 8) != 0) { // found sensor has different address than sensors in use
+            count++;
+            Serial.print("New Sensor              : ");
+            printOwAddress(address);
+          }
+          while (oneWire.search(address));
+          if (count == 0) {
+            Serial.println(F("NO new temperature sensors found!"));
+          } else {
+            Serial.print(count, DEC);
+            Serial.println(F(" new temperature sensors found!"));
+          }
+        }
+      }
+    }
   }
 }
+
+byte hexToByte (char c) {
+  if ( (c >= '0') && (c <= '9') ) {
+    return c - '0';
+  }
+  if ( (c >= 'A') && (c <= 'F') ) {
+    return (c - 'A') + 10;
+  }
+}
+
+void printOwAddress(uint8_t* address) {
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    if (address[i] < 0x10) {
+      Serial.print("0");
+    }
+    Serial.print(address[i], HEX);
+    if (i < 7) {
+      Serial.print(" ");
+    }
+  }
+}
+
 
 void printHelp() {
   Serial.println(F("    __  __          __                             _"));
@@ -816,7 +1000,8 @@ void printHelp() {
   Serial.println("");
   Serial.println(F("Enter HELP \"command name\" to get detailled information about a command."));
   Serial.println("");
-  Serial.println(F("cat        Show content of a file.."));
+  Serial.println(F("cat        Show content of a file."));
+  Serial.println(F("cfgtmp     Configure HW adresses of temperature sensors.."));
   Serial.println(F("date       Show or set current date."));
   Serial.println(F("datetime   Show or set current date and time."));
   Serial.println(F("dir        List files on storage media."));
@@ -824,11 +1009,15 @@ void printHelp() {
   Serial.println(F("hwrst      Do a real HW reset. Use carefully!"));
   Serial.println(F("info       Show current status of controller."));
   Serial.println(F("now        Print current date and time."));
+  Serial.println(F("list       List content of EEPROM."));
   Serial.println(F("ls         List files on storage media."));
   Serial.println(F("logint     Configure intervall for logging sensor data."));
   Serial.println(F("nutcal     Calibration values for dosing pumps."));
   Serial.println(F("nutrient   Configure amount of nutrient to be added after refill."));
+  Serial.println(F("refill     Trigger manual refill of reservoir."));
   Serial.println(F("reset      Set all parameters to default values."));
+  Serial.println(F("sdeject    Disable SD card for save removal."));
+  Serial.println(F("sdinit     Re-initialise SD card."));
   Serial.println(F("time       Show or set current time."));
   Serial.println(F("water      List or edit configured timers for irrigation."));
 }
@@ -868,6 +1057,11 @@ void printHelp_loginterval() {
   Serial.println(F("Set interval for logging data to SD card:"));
   Serial.println(F("   loginterval"));
   Serial.println(F("   loginterval <1...30 minutes>"));
+}
+void printHelp_cfgtmp() {
+  Serial.println(F("Configure temperature sensor hw adresses:"));
+  Serial.println(F("   cfgtmp"));
+  Serial.println(F("   cfgtmp <0...2 which sensor> <FF FF FF FF FF FF FF FF>"));
 }
 void printDateTime() {
   char localBuffer[25]; // "Now: 00.00.0000 00:00:00"
@@ -931,16 +1125,18 @@ void logEvent(const char *data, byte msgType, boolean serialOnly) {
 
 void logToSd(char *localBuffer) {
 #ifdef SDCARD
-  // open the file for write at end like the Native SD library
-  if (!myFile.open(logFileName, O_RDWR | O_CREAT | O_AT_END)) {
-    sd.errorPrint(F("opening file faild."));
-  }
-  else {
-    // if the file opened okay, write to it:
-    myFile.println(localBuffer);
+  if (sdEnabled == true) {
+    // open the file for write at end like the Native SD library
+    if (!myFile.open(logFileName, O_RDWR | O_CREAT | O_AT_END)) {
+      sd.errorPrint(F("opening file faild."));
+    }
+    else {
+      // if the file opened okay, write to it:
+      myFile.println(localBuffer);
 
-    // close the file:
-    myFile.close();
+      // close the file:
+      myFile.close();
+    }
   }
 #endif
 }
@@ -1116,7 +1312,7 @@ void eeprom_serial_dump_table(int bytesPerRow) {
     // if this is the first byte of the row,
     // start row by printing the byte address
     if (j == 0) {
-      sprintf(buf, "%03X: ", i);
+      sprintf(buf, "%03d: ", i);
       Serial.print(buf);
     }
 
