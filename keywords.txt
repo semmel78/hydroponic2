@@ -1,0 +1,10 @@
+CheckSerialManager	KEYWORD2
+printHelp_time	KEYWORD2
+printHelp_date	KEYWORD2
+printHelp_datetime	KEYWORD2
+printHelp_water	KEYWORD2
+printHelp_nutrient	KEYWORD2
+printHelp_nutcal	KEYWORD2
+printDateTime	KEYWORD2
+printHelp_loginterval	KEYWORD2
+interruptRoutineFloatSensorCounter	KEYWORD2

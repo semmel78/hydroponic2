@@ -1,0 +1,762 @@
+#include <Time.h>
+#include <TimeLib.h>
+#include <Wire.h>
+#include <DS1307RTC.h>  // a basic DS1307 library that returns time as a time_t
+#include <EEPROM.h>
+#include <RBD_SerialManager.h>
+
+#define STATE_IDLE      0
+#define STATE_IRRIGATE  1
+#define STATE_DRAIN     2
+#define STATE_REFILL    3
+#define STATE_FERTILIZE 4
+#define STATE_ERROR     5
+
+const byte MSG_INFO = 0;
+const byte MSG_WARNING = 1;
+const byte MSG_ERROR = 2;
+
+
+const int EEPROM_WATER_TIMER = 0;
+const int EEPROM_NUTRIENT_TIMER = 27;
+const int EEPROM_LOG_INTERVALL = 29;
+const int EEPROM_DRAIN_DURATION = 30;
+const int MAX_WATER_TIMERS = 9;
+
+const int PIN_IRRIGATION = 3;
+const int PIN_NUTRIENT_1 = 4;
+const int PIN_NUTRIENT_2 = 5;
+const int PIN_REFILL_VALVE = 6;
+const int PIN_REFILL_SENSOR = 16;
+
+const int PIN_RESERVOIR_EMPTY = 14;
+const int PIN_RESERVOIR_VERY_EMPTY = 14;
+const int PIN_RESERVOIR_FULL = 15;
+const int PIN_RESERVOIR_VERY_FULL = 15;
+
+const float ML_PER_TICK = 2.5;  // ml per sensor pulse (1000ml / number of ticks per litre)
+const int MAX_REFILL_TIME = 10; // Maximum time for refill state in minutes
+
+struct timer_t {
+  unsigned int startTime;
+  unsigned int endTime;
+  byte duration;
+};
+
+RBD::SerialManager serial_manager;
+
+// Constructors
+void CheckSerialManager();
+void printHelp_time();
+void printHelp_date();
+void printHelp_datetime();
+void interruptRoutineFloatSensorCounter();
+void printDigits(int digits, int numdigits = 2);
+void LogEvent_P(const char *data, byte msgType = MSG_INFO);
+void LogEvent(const char *data, byte msgType = MSG_INFO);
+
+void sortWaterTimers();
+int struct_cmp_timer(const void *a, const void *b);
+
+
+
+
+timer_t irrigationAlarms[MAX_WATER_TIMERS];
+int irrigationTimers = 0;
+
+uint8_t stateWatering = STATE_IDLE;
+
+unsigned int floatSensorCounter = 0;
+
+char msgBuffer[40];
+
+void setup() {
+  // Start serial manager for serial command processing
+  serial_manager.start();
+  serial_manager.setDelimiter(' ');
+
+  // sync with RTC
+  setSyncProvider(RTC.get);   // the function to get the time from the RTC
+  setSyncInterval(120);
+
+  if (timeStatus() != timeSet) {
+    Serial.println(F("Unable to sync with the RTC."));
+    Serial.println(F("Setting time manually."));
+    // For debug purposes only
+    setTime(0, 0, 0, 1, 1, 2016);
+    delay(20);
+  } else {
+    Serial.println(F("RTC has set the system time."));
+  }
+
+  // Configure pins
+  pinMode(PIN_IRRIGATION, OUTPUT);
+  pinMode(PIN_NUTRIENT_1, OUTPUT);
+  pinMode(PIN_NUTRIENT_2, OUTPUT);
+  pinMode(PIN_REFILL_VALVE, OUTPUT);
+
+  pinMode(PIN_RESERVOIR_EMPTY, INPUT_PULLUP);
+  pinMode(PIN_RESERVOIR_VERY_EMPTY, INPUT_PULLUP);
+  pinMode(PIN_RESERVOIR_FULL, INPUT_PULLUP);
+  pinMode(PIN_RESERVOIR_VERY_FULL, INPUT_PULLUP);
+
+  digitalWrite(PIN_IRRIGATION, LOW);
+  digitalWrite(PIN_NUTRIENT_1, LOW);
+  digitalWrite(PIN_NUTRIENT_2, LOW);
+  digitalWrite(PIN_REFILL_VALVE, LOW);
+
+  pinMode(PIN_REFILL_SENSOR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_REFILL_SENSOR), interruptRoutineFloatSensorCounter, RISING);
+
+  Serial.println("Pinmode done.");
+
+  readWaterTimers();
+
+  Serial.println("Setup finished.");
+}
+
+void loop() {
+  static float refilledWater = 0;
+  static int fertilizerPumpRunTime1;
+  static int fertilizerPumpRunTime2;
+  static unsigned long fertilizerPumpStartTime;
+  static unsigned int nowHM = 0;
+  static unsigned int nextActionTime = 0;
+  static unsigned long floatSensorTime = 0;
+  static byte floatSensorErrorCounter = 0;
+
+  // Serial Command Interface
+  CheckSerialManager();
+
+  // Get current time with 1 minute resolution
+  nowHM = hour() * 60 + minute();
+
+  switch (stateWatering) {
+    case STATE_IDLE:
+      for (int i = 0; i < MAX_WATER_TIMERS; i++) {
+        if (nowHM >= irrigationAlarms[i].startTime && nowHM <= irrigationAlarms[i].endTime && irrigationAlarms[i].duration > 0) { // irrigation time slot
+          digitalWrite(PIN_IRRIGATION, HIGH);
+          nextActionTime = irrigationAlarms[i].endTime;
+          stateWatering = STATE_IRRIGATE;
+
+          LogEvent_P(PSTR("Irrigation pump ON."), MSG_INFO);
+        }
+      }
+      // if reservoir is empty or very empty, directly jump to refill state
+      if (digitalRead(PIN_RESERVOIR_EMPTY) == HIGH || digitalRead(PIN_RESERVOIR_VERY_EMPTY) == HIGH) {
+        digitalWrite(PIN_REFILL_VALVE, HIGH);
+        LogEvent_P(PSTR("Refill valve ON."), MSG_INFO);
+
+        nextActionTime = nowHM + MAX_REFILL_TIME; // maximum time for refilling!!!
+        floatSensorCounter = 0;      //Set floatSensorCounter to 0 ready for calculations
+        floatSensorTime = millis();
+        sei();            //Enables interrupts
+        stateWatering = STATE_REFILL;
+      }
+      break;
+    case STATE_IRRIGATE:
+      if (nowHM >= nextActionTime) {
+        digitalWrite(PIN_IRRIGATION, LOW);
+        LogEvent_P(PSTR("Irrigation pump OFF."), MSG_INFO);
+
+        nextActionTime = nowHM + (int)EEPROM.read(EEPROM_DRAIN_DURATION);
+        stateWatering = STATE_DRAIN;
+      }
+      break;
+    case STATE_DRAIN:
+      if (nowHM >= nextActionTime) {
+        digitalWrite(PIN_REFILL_VALVE, HIGH);
+        LogEvent_P(PSTR("Refill valve ON."), MSG_INFO);
+
+        nextActionTime = nowHM + MAX_REFILL_TIME; // maximum time for refilling!!!
+        floatSensorCounter = 0;                   // Set floatSensorCounter to 0 ready for calculations
+        floatSensorTime = millis();
+        sei();                                    // Enables interrupts
+        stateWatering = STATE_REFILL;
+      }
+      break;
+    case STATE_REFILL:
+      if (nowHM >= nextActionTime) {
+        digitalWrite(PIN_REFILL_VALVE, LOW);
+        LogEvent_P(PSTR("Refill took too long."), MSG_ERROR);
+
+        stateWatering = STATE_ERROR;
+        // it seems that water flow is too low or not existing (has someone turned off the main valve?)
+      }
+      if (digitalRead(PIN_RESERVOIR_FULL) == HIGH || digitalRead(PIN_RESERVOIR_VERY_FULL) == HIGH) {
+        digitalWrite(PIN_REFILL_VALVE, LOW); // stop valve
+        LogEvent_P(PSTR("Refill valve OFF."), MSG_INFO);
+
+        // --> evaluate amount of water filled to reservoir
+        cli(); // Deactivate interrupt
+        refilledWater = refilledWater + (float)floatSensorCounter * ML_PER_TICK;  // calculate final amount of water which was refilled to reservoir
+        LogEvent_P(PSTR("Here the amount of water will be inserted somewhen."), MSG_INFO);
+        sprintf(msgBuffer, "%dml of water were refilled.", (int)(refilledWater + .5));
+        LogEvent(msgBuffer, MSG_INFO);
+
+        fertilizerPumpRunTime1 = (int)EEPROM.read(EEPROM_NUTRIENT_TIMER) * refilledWater / 1000;
+        fertilizerPumpRunTime2 = (int)EEPROM.read(EEPROM_NUTRIENT_TIMER + 1) * refilledWater / 1000;
+        fertilizerPumpStartTime = millis();
+        digitalWrite(PIN_NUTRIENT_1, HIGH);
+        digitalWrite(PIN_NUTRIENT_2, HIGH);
+        LogEvent_P(PSTR("Nutrient pumps 1 and 2 ON."), MSG_INFO);
+
+        stateWatering = STATE_FERTILIZE;
+      }
+      if (millis() - floatSensorTime > 1000) {
+        cli();
+        refilledWater = refilledWater + (float)floatSensorCounter * ML_PER_TICK;  // calculate intermediate amount of water which was refilled to reservoir
+        if (floatSensorCounter < 20) { // No water flow since 1 second
+          floatSensorErrorCounter++;   // Try some times
+          LogEvent_P(PSTR("No flow."), MSG_ERROR);
+        }
+        floatSensorCounter = 0; // Reset floatSensorCounter
+        floatSensorTime = millis();
+        sei(); // Enable interrupt again
+      }
+      if (floatSensorErrorCounter > 2) {
+        // Refill faild goto ERROR
+        floatSensorErrorCounter = 0;
+        floatSensorCounter = 0;
+        LogEvent_P(PSTR("No water flow detected during refill."), MSG_ERROR);
+        stateWatering = STATE_ERROR;
+        break;
+      }
+      break;
+    case STATE_FERTILIZE:
+      if (millis() - fertilizerPumpStartTime >= fertilizerPumpRunTime1 && fertilizerPumpRunTime1 > 0) {
+        // stop pump 1
+        digitalWrite(PIN_NUTRIENT_1, LOW);
+        LogEvent_P(PSTR("Nutrient pump 1 OFF."), MSG_INFO);
+        fertilizerPumpRunTime1 = 0;
+      }
+      if (millis() - fertilizerPumpStartTime >= fertilizerPumpRunTime2 && fertilizerPumpRunTime2 > 0) {
+        // stop pump 2
+        digitalWrite(PIN_NUTRIENT_2, LOW);
+        LogEvent_P(PSTR("Nutrient pump 2 OFF."), MSG_INFO);
+        fertilizerPumpRunTime2 = 0;
+      }
+      if (millis() - fertilizerPumpStartTime >= fertilizerPumpRunTime1 && millis() - fertilizerPumpStartTime >= fertilizerPumpRunTime2) {
+        refilledWater = 0;
+
+        LogEvent_P(PSTR("Refill and adding nutrients finished."), MSG_INFO);
+        stateWatering = STATE_IDLE;
+      }
+      break;
+    case STATE_ERROR:
+      //send sms
+      break;
+    default:
+      // something went wrong
+      break;
+  }
+
+  // do sensor logging
+}
+
+void readWaterTimers() {
+  // Read watering timers from EEPROM
+  for (int i = 0; i < MAX_WATER_TIMERS; i++) {
+    byte myHour     =  EEPROM.read(EEPROM_WATER_TIMER + i * 3 );
+    byte myMinute   =  EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 1);
+    byte myDuration =  EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 2);
+    if (myHour >= 0 && myHour <= 23 &&
+        myMinute >= 0 && myMinute <= 59 &&
+        myDuration >= 0 && myDuration < 255) {
+      irrigationAlarms[i].startTime = myHour * 60 + myMinute;
+      irrigationAlarms[i].endTime = myHour * 60 + myMinute + myDuration;
+      irrigationAlarms[i].duration = myDuration;
+    }
+    else {
+      irrigationAlarms[i].startTime = 99 * 60 + 99;
+      irrigationAlarms[i].endTime = 99 * 60 + 99;
+      irrigationAlarms[i].duration = 0;
+    }
+  }
+  sortWaterTimers();
+}
+void CheckSerialManager() {
+  if (serial_manager.onReceive()) {
+    if (serial_manager.isCmd("help")) {
+      printHelp_time();
+      printHelp_date();
+      printHelp_datetime();
+    }
+    if (serial_manager.isCmd("time")) {
+      if (serial_manager.getParam().length() >= 8) {
+        String value = serial_manager.getParam();
+        setTime(value.substring(0, 2).toInt(), value.substring(3, 5).toInt(), value.substring(6, 8).toInt(), day(), month(), year());
+        RTC.set(now());
+        // Log Event to SD
+        serial_manager.println(F("OK"));
+        serial_manager.print(F("Current time: "));
+        printTime();
+        serial_manager.println("");
+        LogEvent_P(PSTR("INFO - Time set manually."));
+      }
+      else {
+        // Print help
+        printHelp_time();
+        serial_manager.print(F("Current time: "));
+        printTime();
+        serial_manager.println("");
+      }
+    }
+    if (serial_manager.isCmd("date")) {
+      if (serial_manager.getParam().length() >= 10) {
+        String value = serial_manager.getParam();
+        setTime(hour(), minute(), second(), value.substring(0, 2).toInt(), value.substring(3, 5).toInt(), value.substring(6, 10).toInt());
+        RTC.set(now());
+        // Log Event to SD
+        serial_manager.println(F("OK"));
+        serial_manager.print(F("Current date: "));
+        printDate();
+        serial_manager.println("");
+        LogEvent_P(PSTR("INFO - Date set manually."));
+      }
+      else {
+        // Print help
+        printHelp_date();
+        serial_manager.print(F("Current date: "));
+        printDate();
+        serial_manager.println("");
+      }
+    }
+    if (serial_manager.isCmd("datetime")) {
+      if (serial_manager.getParam().length() >= 19) {
+        String value = serial_manager.getParam();
+        setTime(value.substring(11, 13).toInt(), value.substring(14, 16).toInt(), value.substring(17, 19).toInt(), value.substring(0, 2).toInt(), value.substring(3, 5).toInt(), value.substring(6, 10).toInt());
+        RTC.set(now());
+        // Log Event to SD
+        serial_manager.println(F("OK"));
+        serial_manager.print(F("Now: "));
+        SprintTime();
+        serial_manager.print(msgBuffer);
+        serial_manager.print(" ");
+        SprintDate();
+        serial_manager.print(msgBuffer);
+        serial_manager.println("");
+        LogEvent_P(PSTR("INFO - Date and time set manually."));
+      }
+      else {
+        // Print help
+        printHelp_datetime();
+        serial_manager.print(F("Now: "));
+        SprintTime();
+        serial_manager.print(msgBuffer);
+        serial_manager.print(" ");
+        SprintDate();
+        serial_manager.print(msgBuffer);
+        serial_manager.println("");
+      }
+    }
+    if (serial_manager.isCmd("water")) {
+      if (serial_manager.getParam().length() > 0) {
+        int channel = -1;
+        int myHour = -1;
+        int myMinute = -1;
+        int myDuration = -1;
+        int myEnabled = -1;
+
+        String value = serial_manager.getParam();
+        // set watering time
+        if (value.length() > 8) {
+          channel = value.substring(0, 1).toInt();
+          myHour = value.substring(2, 4).toInt();
+          myMinute = value.substring(5, 7).toInt();
+          myDuration = value.substring(8, value.length()).toInt();
+        }
+
+        if (value.length() < 6) {
+          channel = value.substring(0, 1).toInt();
+          if (value.substring(2, value.length()).toInt() == 0) {
+            myHour = 0;
+            myMinute = 0;
+            myDuration = 0;
+          }
+        }
+
+        if (channel >= 0 && channel < MAX_WATER_TIMERS &&
+            myHour >= 0 && myHour <= 23 &&
+            myMinute >= 0 && myMinute <= 59 &&
+            myDuration >= 0 && myDuration < 255) {
+
+          EEPROM.write(EEPROM_WATER_TIMER + channel * 3, myHour);       // Hour
+          EEPROM.write(EEPROM_WATER_TIMER + channel * 3 + 1, myMinute); // Minute
+          EEPROM.write(EEPROM_WATER_TIMER + channel * 3 + 2, myDuration); // Duration
+
+          //printWater2(channel);
+
+          // reread from EEPROM
+          readWaterTimers();
+
+          // write to EEPROM
+          for (int i = 0; i < MAX_WATER_TIMERS; i++) {
+            EEPROM.write(i * 3, (byte)(irrigationAlarms[i].startTime / 60));       // Hour
+            EEPROM.write(i * 3 + 1, (byte)(irrigationAlarms[i].startTime % 60)); // Minute
+            EEPROM.write(i * 3 + 2, irrigationAlarms[i].duration); // Duration
+          }
+          LogEvent_P(PSTR("INFO - Water Timer changed."));
+          // find next time
+          // free current alarm
+          // create new alarm
+
+        }
+        else if (channel >= 0 && channel <= 3) {
+          if (myEnabled == 1) {
+
+          }
+          if (myEnabled == 0) {
+
+          }
+        }
+        printWater2(channel);
+      }
+      else {
+        // Print help
+        printHelp_water();
+        printWaterRAM();
+        printWaterEEPROM();
+      }
+    }
+    if (serial_manager.isCmd("erase")) {
+      for (int i = 0; i < EEPROM.length(); i++) {
+        EEPROM.write(i, 0xFF);
+      }
+      serial_manager.println("OK");
+    }
+    if (serial_manager.isCmd("list")) {
+      eeprom_serial_dump_table(10);
+    }
+    if (serial_manager.isCmd("set")) {
+      int value = serial_manager.getParam().toInt();
+      switch (value) {
+        case 0:
+          digitalWrite(PIN_NUTRIENT_1, HIGH);
+        case 1:
+          digitalWrite(PIN_NUTRIENT_2, HIGH);
+        case 2:
+          digitalWrite(PIN_IRRIGATION, HIGH);
+        case 3:
+          digitalWrite(PIN_REFILL_VALVE, HIGH);
+      }
+    }
+    if (serial_manager.isCmd("reset")) {
+      int value = serial_manager.getParam().toInt();
+      switch (value) {
+        case 0:
+          digitalWrite(PIN_NUTRIENT_1, LOW);
+        case 1:
+          digitalWrite(PIN_NUTRIENT_2, LOW);
+        case 2:
+          digitalWrite(PIN_IRRIGATION, LOW);
+        case 3:
+          digitalWrite(PIN_REFILL_VALVE, LOW);
+      }
+    }
+    if (serial_manager.isCmd("nutrient")) {
+      if (serial_manager.getParam().length() > 0) {
+        int channel = -1;
+        int myDuration = -1;
+
+        String value = serial_manager.getParam();
+        channel = value.substring(0, 1).toInt();
+        myDuration = value.substring(2, value.length()).toInt();
+        if (channel >= 0 && channel <= 1 &&
+            myDuration >= 0 && myDuration <= 255) {
+          EEPROM.write(EEPROM_NUTRIENT_TIMER + channel, myDuration);
+          printNutrient(channel);
+        }
+      }
+      else {
+        // Print help
+        printHelp_nutrient();
+        for (int i = 0; i <= 1; i++)
+          printNutrient(i);
+      }
+    }
+
+
+    if (serial_manager.isCmd("eeprom")) {
+      printWaterEEPROM();
+    }
+    if (serial_manager.isCmd("ram")) {
+      printWaterRAM();
+    }
+  }
+}
+
+void printHelp_time() {
+  serial_manager.println(F("time <hh>:<mm>:<ss>"));
+}
+void printHelp_date() {
+  serial_manager.println(F("date <dd>.<mm>.<yyyy>"));
+}
+void printHelp_datetime() {
+  serial_manager.println(F("datetime <dd>.<mm>.<yyyy> <hh>:<mm>:<ss>"));
+}
+void printHelp_water() {
+  serial_manager.println(F("water <0...3> <hh>:<mm> <duration in minutes max. 255>"));
+}
+void printHelp_nutrient() {
+  serial_manager.println(F("nutrient<1...2> <duration in seconds max. 255>"));
+}
+void printTime() {
+  printDigits(hour(), 2);
+  serial_manager.print(":");
+  printDigits(minute(), 2);
+  serial_manager.print(":");
+  printDigits(second(), 2);
+}
+void SprintTime() {
+  sprintf(msgBuffer, "%02d:%02d:%02d", hour(), minute(), second());
+}
+
+void LogEvent_P(const char *data, byte msgType) {
+  char localBuffer[100];
+  char localBufferType[12];
+  byte pos;
+
+  sprintf(localBuffer, "%02d:%02d:%02d - ", hour(), minute(), second());
+  switch (msgType) {
+    case MSG_INFO:
+    default:
+      strcpy_P(localBufferType, PSTR("INFO - "));
+      break;
+    case MSG_WARNING:
+      strcpy_P(localBufferType, PSTR("WARNING - "));
+      break;
+    case MSG_ERROR:
+      strcpy_P(localBufferType, PSTR("ERROR - "));
+      break;
+  }
+  strcat(localBuffer, localBufferType);
+  pos = strlen(localBuffer);
+  //  strcat(localBuffer, data);
+  
+  while (pgm_read_byte(data) != 0x00) {
+    localBuffer[pos] = pgm_read_byte(data ++);
+    pos++;
+  }
+  localBuffer[pos] = 0x00;
+
+  Serial.println(localBuffer);
+  // add SD storage routin
+}
+
+void LogEvent(const char *data, byte msgType) {
+  char localBuffer[100];
+  char localBufferType[12];
+  byte pos;
+
+  sprintf(localBuffer, "%02d:%02d:%02d - ", hour(), minute(), second());
+  switch (msgType) {
+    case MSG_INFO:
+    default:
+      strcpy_P(localBufferType, PSTR("INFO - "));
+      break;
+    case MSG_WARNING:
+      strcpy_P(localBufferType, PSTR("WARNING - "));
+      break;
+    case MSG_ERROR:
+      strcpy_P(localBufferType, PSTR("ERROR - "));
+      break;
+  }
+  strcat(localBuffer, localBufferType);
+  pos = strlen(localBuffer);
+  
+  while (*data != '\0') {
+    localBuffer[pos] = *data++;
+    pos++;
+  }
+  localBuffer[pos] = 0x00;
+  Serial.println(localBuffer);
+  // add SD storage routin
+}
+
+void SprintDate() {
+  sprintf(msgBuffer, "%02d.%02d.%04d", day(), month(), year());
+}
+
+void printDate() {
+  serial_manager.print(day());
+  serial_manager.print(".");
+  serial_manager.print(month());
+  serial_manager.print(".");
+  serial_manager.print(year());
+}
+
+void printWater(int i) {
+  serial_manager.print(F("Water Timer "));
+  serial_manager.print(i);
+  serial_manager.print(F(": Start: "));
+  printDigits(EEPROM.read(EEPROM_WATER_TIMER + i * 3), 2);
+  serial_manager.print(":");
+  printDigits(EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 1), 2);
+  serial_manager.print(F(" Duration: "));
+  printDigits(EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 2), 3);
+  serial_manager.print(F(" Current Start: "));
+  //  serial_manager.print(Alarm.read(alarms[i * 2]));
+  serial_manager.print(F(" Current End: "));
+  //  serial_manager.print(Alarm.read(alarms[i * 2 + 1]));
+  serial_manager.print(F(" Enabled: "));
+  //  serial_manager.println(Alarm.isAlarmEnabled(alarms[i * 2 + 1]));
+}
+
+void printWaterEEPROM() {
+  serial_manager.println(F("EEPROM Data"));
+  for (int i = 0; i < MAX_WATER_TIMERS; i++) {
+    serial_manager.print(F("Water Timer "));
+    serial_manager.print(i);
+    serial_manager.print(" - ");
+    printDigits(EEPROM.read(i * 3));       // Hour
+    serial_manager.print(":");
+    printDigits(EEPROM.read(i * 3 + 1)); // Minute
+    serial_manager.print(F(" Duration: "));
+    printDigits(EEPROM.read(i * 3 + 2), 3); // Duration
+    serial_manager.println("");
+  }
+}
+void printWaterRAM() {
+  serial_manager.println(F("RAM Data"));
+  for (int i = 0; i < MAX_WATER_TIMERS; i++) {
+    serial_manager.print(F("Water Timer "));
+    serial_manager.print(i);
+    serial_manager.print(" - ");
+    printDigits(irrigationAlarms[i].startTime / 60);       // Hour
+    serial_manager.print(":");
+    printDigits(irrigationAlarms[i].startTime % 60); // Minute
+    serial_manager.print(F(" Duration: "));
+    printDigits(irrigationAlarms[i].duration % 60, 3); // Duration
+    serial_manager.println("");
+  }
+}
+
+void printWater2(int i) {
+  serial_manager.print(F("Water Timer "));
+  serial_manager.print(i);
+  if (EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 2) > 0) {
+    serial_manager.print(F(": Start: "));
+    if (EEPROM.read(EEPROM_WATER_TIMER + i * 3) < 24) {
+      printDigits(EEPROM.read(EEPROM_WATER_TIMER + i * 3), 2);
+    }
+    else {
+      serial_manager.print("--");
+    }
+    serial_manager.print(":");
+    if (EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 1) < 60) {
+      printDigits(EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 1), 2);
+    }
+    else {
+      serial_manager.print("--");
+    }
+    serial_manager.print(F(" Duration: "));
+    printDigits(EEPROM.read(EEPROM_WATER_TIMER + i * 3 + 2), 3);
+    serial_manager.print(F(" Current Start: "));
+    serial_manager.print((int)irrigationAlarms[i].startTime / 60);
+    serial_manager.print(F(":"));
+    serial_manager.print((int)irrigationAlarms[i].startTime % 60);
+    serial_manager.print(F(" Duration: "));
+    serial_manager.println(irrigationAlarms[i].duration);
+  }
+  else {
+    serial_manager.println(F(": ---"));
+  }
+}
+
+void printNutrient(int channel) {
+  serial_manager.print(F("Nutrient "));
+  serial_manager.print(channel);
+  serial_manager.print(": ");
+  printDigits(EEPROM.read(EEPROM_NUTRIENT_TIMER + channel), 3);
+  serial_manager.println("");
+}
+
+void printDigits(int digits, int numdigits) {
+  for (int i = 1; i < numdigits; i++) {
+    if (digits < pow(10, i))
+      Serial.print('0');
+  }
+  Serial.print(digits);
+}
+
+
+
+
+
+void interruptRoutineFloatSensorCounter() {
+  floatSensorCounter++;
+}
+
+/* qsort struct comparision function (hour * 60 + minutes field) */
+int struct_cmp_timer(const void *a, const void *b)
+{
+  struct timer_t *ia = (struct timer_t *)a;
+  struct timer_t *ib = (struct timer_t *)b;
+  return (ia->startTime - ib->startTime);
+  /*
+     comparison: returns negative if b > a
+     and positive if a > b.
+  */
+}
+
+void sortWaterTimers() {
+  size_t structs_len = sizeof(irrigationAlarms) / sizeof(struct timer_t);
+  uint32_t start = micros();
+  /* sort array using qsort functions */
+  qsort(irrigationAlarms, structs_len, sizeof(struct timer_t), struct_cmp_timer);
+  uint32_t stop = micros();
+  Serial.print("quickSort:\t");
+  Serial.println(stop - start);
+}
+
+
+void eeprom_serial_dump_table(int bytesPerRow) {
+  // address counter
+  int i;
+
+  // row bytes counter
+  int j;
+
+  // byte read from eeprom
+  byte b;
+
+  // temporary buffer for sprintf
+  char buf[10];
+
+
+  // initialize row counter
+  j = 0;
+
+  // go from first to last eeprom address
+  for (i = 0; i <= 100; i++) {
+
+    // if this is the first byte of the row,
+    // start row by printing the byte address
+    if (j == 0) {
+      sprintf(buf, "%03X: ", i);
+      Serial.print(buf);
+    }
+
+    // read current byte from eeprom
+    b = EEPROM.read(i);
+
+    // write byte in hex form
+    sprintf(buf, "%02X ", b);
+
+    // increment row counter
+    j++;
+
+    // if this is the last byte of the row,
+    // reset row counter and use println()
+    // to start a new line
+    if (j == bytesPerRow) {
+      j = 0;
+      Serial.println(buf);
+    }
+    // else just print the hex value with print()
+    else {
+      Serial.print(buf);
+    }
+  }
+}
