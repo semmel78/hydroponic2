@@ -446,8 +446,6 @@ void loop() {
       strcat(msgBuffer, "\t");
       dtostrf(6.4F, 0, 1, &msgBuffer[strlen(msgBuffer)]);
       logEvent(msgBuffer, MSG_SENSOR);
-      //sprintf_P(msgBuffer, PSTR("Free RAM: %d byte."), freeRam());
-      //logEvent(msgBuffer, MSG_INFO);
     }
   }
 

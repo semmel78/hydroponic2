@@ -16,7 +16,6 @@
 #define LOG_LOGINTERVAL  5
 #define LOG_CFGFLOW      6
 
-
 #define MSG_INFO         0
 #define MSG_WARNING      1
 #define MSG_ERROR        2
@@ -40,7 +39,6 @@ void printHelpNutcal();
 void printHelpNutrient();
 void printHelpTime();
 void printHelpWater();
-
 
 void printDateTime();
 
