@@ -808,10 +808,12 @@ void CheckSerialManager() {
       if (!sd.begin(PIN_CHIP_SELECT, SPI_HALF_SPEED)) {
         sd.initErrorPrint();
       }
-      sdEnabled = true;
-      setLogFileName();
-      logEvent_P(PSTR("SD card has been re-initialised."), MSG_INFO);
-      //switch off led
+      else {
+        sdEnabled = true;
+        setLogFileName();
+        logEvent_P(PSTR("SD card has been re-initialised."), MSG_INFO);
+        //switch off led
+      }
     }
 #endif
 
@@ -862,7 +864,6 @@ void CheckSerialManager() {
     if (serial_manager.isCmd("info") || serial_manager.isCmd("INFO")) {
       Serial.println(F("--------- status begin ---------"));
       logParameters(LOG_ALL, SERIAL_ONLY);
-      Serial.println(freeRam());
       Serial.println(F("---------- status end ----------"));
     }
 
@@ -1307,8 +1308,8 @@ void logParameters(byte whatToLog, boolean serialOnly) {
       Serial.print(F("readCID failed"));
     }
     else {
-      Serial.print(F("\nManufacturer ID: "));
-      Serial.println(int(cid.mid));
+      Serial.print(F("Manufacturer ID: "));
+      Serial.println(int(cid.mid), HEX);
       Serial.print(F("OEM ID: "));
       Serial.print(cid.oid[0]);
       Serial.println(cid.oid[1]);
@@ -1318,7 +1319,7 @@ void logParameters(byte whatToLog, boolean serialOnly) {
       }
       Serial.println("");
       Serial.print(F("Version: "));
-      Serial.print(int(cid.prv_n), HEX);
+      Serial.print(int(cid.prv_n));
       Serial.print('.');
       Serial.println(int(cid.prv_m));
       Serial.print(F("Serial number: "));
@@ -1335,7 +1336,7 @@ void logParameters(byte whatToLog, boolean serialOnly) {
     cs = cardSize * 0.000512F;
     Serial.print((int)cs);
     Serial.print(",");
-    Serial.print((int)(cs * 100.0F) % 100);
+    Serial.print((int)(cs * 1000.0F) % 1000);
     Serial.println(F(" MB (MB = 1,000,000 bytes)"));
 
     float fs;
@@ -1343,7 +1344,7 @@ void logParameters(byte whatToLog, boolean serialOnly) {
     Serial.print(F("Free Space: "));
     Serial.print((int)fs);
     Serial.print(",");
-    Serial.print((int)(fs * 100.0F) % 100);
+    Serial.print((int)(fs * 1000.0F) % 1000);
     Serial.println(F(" MB (MB = 1,000,000 bytes)"));
 
     Serial.println(F("********** Output States *********"));
