@@ -466,9 +466,7 @@ void loop() {
     // 1  1  1  1
 
     //sprintf(lcdText.row1, "%02d:%02d:%02d  %02d.%02d.%04d", hour(), minute(), second(), day(), month(), year());
-
   }
-
 }
 
 void setLogFileName() {
@@ -1431,7 +1429,6 @@ void logToSd(char *localBuffer) {
   }
 #endif
 }
-
 
 void readOwArdessesFromEeprom(uint8_t* myDeviceAddress, int eepromStartAddress) {
   for (int i = 0; i < 8; i++) {
