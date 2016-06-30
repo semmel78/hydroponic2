@@ -62,9 +62,9 @@ OneWire oneWire(PIN_ONEWIRE);
 // Pass our oneWire reference to Dallas Temperature.
 DallasTemperature sensors(&oneWire);
 // arrays to hold device addresses28 FF AD B5 64 14 1 35
-DeviceAddress  tempCabinet = { 0x28, 0xFF, 0xAD, 0xB5, 0x64, 0x14, 0x1, 0x35 }; // real adress!!!
-DeviceAddress  tempOutside = { 0x28, 0x3F, 0x1C, 0x31, 0x2, 0x0, 0x0, 0x2 };
-DeviceAddress  tempReservoir = { 0x28, 0x1A, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
+DeviceAddress  tempCabinet;
+DeviceAddress  tempOutside;
+DeviceAddress  tempReservoir;
 #endif
 
 
@@ -74,34 +74,23 @@ Bounce debounceBackLight = Bounce();
 Bounce debounceErrorReset = Bounce();
 Bounce debounceSdEject = Bounce();
 
-float tempCabinetValue;
-float tempOutsideValue;
-float tempReservoirValue;
+float cabinetTemperatureValue;
+float outsideTemperatureValue;
+float reservoirTemperatureValue;
 
 
 // Array to hold information about watering cycles
 timer_t irrigationAlarms[MAX_WATER_TIMERS];
 uint8_t stateWatering = STATE_IDLE;
 
-unsigned int floatSensorCounter = 0;
+unsigned int flowSensorCounter = 0;
+unsigned int flowSensorMinPerSecond = 0;
+
 boolean doManualRefill = false;
 char msgBuffer[40];
 unsigned long timer1s;
 byte sdLogIntervall = 0;
 
-void readOwArdessesFromEeprom(uint8_t* myDeviceAddress, int eepromStartAddress) {
-  printOwAddress(tempCabinet);
-  Serial.println("");
-  printOwAddress(tempOutside);
-  Serial.println("");
-  printOwAddress(tempReservoir);
-  Serial.println("");
-  for (int i = eepromStartAddress; i < (eepromStartAddress + 8); i++) {
-    Serial.println(myDeviceAddress[i], HEX);
-    myDeviceAddress[i] = EEPROM.read(eepromStartAddress + i);
-    Serial.println(myDeviceAddress[i], HEX);
-  }
-}
 
 void setup() {
   timeStatus_t myTimeStatus;
@@ -136,6 +125,9 @@ void setup() {
   pinMode(PIN_NUTRIENT_2, OUTPUT);
   pinMode(PIN_REFILL_VALVE, OUTPUT);
 
+  pinMode(13, OUTPUT);
+  digitalWrite(13, HIGH);
+
   digitalWrite(PIN_IRRIGATION, LOW);
   digitalWrite(PIN_NUTRIENT_1, LOW);
   digitalWrite(PIN_NUTRIENT_2, LOW);
@@ -164,7 +156,7 @@ void setup() {
 
   // Configure input for water flow sensor and attache interrupt
   pinMode(PIN_REFILL_SENSOR, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_REFILL_SENSOR), interruptRoutineFloatSensorCounter, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_REFILL_SENSOR), interruptRoutineFlowSensorCounter, RISING);
   logEvent_P(PSTR("Setting pin modes done."), MSG_INFO);
 
   // read configuration from EEPROM
@@ -172,7 +164,12 @@ void setup() {
   if (sdLogIntervall < 1 or sdLogIntervall > 30) {
     sdLogIntervall = 5;
   }
-  tempCabinet[0] = 33;
+  flowSensorMinPerSecond = EEPROMReadInt(EEPROM_FLOW_SENSOR_MIN_PER_SECOND);
+  if (flowSensorMinPerSecond < 1 or flowSensorMinPerSecond > 65000) {
+    flowSensorMinPerSecond = 20;
+  }
+
+
   readOwArdessesFromEeprom(tempCabinet, EEPROM_TEMP_CABINET);
   readOwArdessesFromEeprom(tempOutside, EEPROM_TEMP_OUTSIDE);
   readOwArdessesFromEeprom(tempReservoir, EEPROM_TEMP_RESERVOIR);
@@ -180,6 +177,7 @@ void setup() {
 #ifdef DALLAS
   // Start up the library for the Temperature Sensors
   sensors.begin();
+  sensors.setWaitForConversion(false);
 
   // locate devices on the bus
   sprintf_P(msgBuffer, PSTR("Temperature sensors found: %d."), sensors.getDeviceCount());
@@ -212,6 +210,8 @@ void setup() {
     logEvent_P(PSTR("OneWire Reservoir Sensor not found."), MSG_ERROR);
   }
 
+  sensors.requestTemperatures();
+
   logEvent_P(PSTR("OneWire initialised."), MSG_INFO);
 #endif
 
@@ -223,9 +223,6 @@ void setup() {
 
   readWaterTimers();
   logEvent_P(PSTR("Setup finished."), MSG_INFO);
-  //sprintf_P(msgBuffer, PSTR("Free RAM: %d byte."), freeRam());
-  //logEvent(msgBuffer, MSG_INFO);
-
 }
 
 void loop() {
@@ -235,13 +232,17 @@ void loop() {
   static unsigned long fertilizerPumpStartTime;
   static unsigned int nowHM = 0;
   static unsigned int nextActionTime = 0;
-  static unsigned long floatSensorTime = 0;
-  static byte floatSensorErrorCounter = 0;
+  static unsigned long flowSensorTime = 0;
+  static byte flowSensorErrorCounter = 0;
   static unsigned long lcdUpdateTime;
   static byte lastMinute;
 
   // Serial Command Interface
   CheckSerialManager();
+
+
+  // blink pin 13
+  digitalWrite(13, !digitalRead(13));
 
   // Get current time with 1 minute resolution
   nowHM = hour() * 60 + minute();
@@ -270,9 +271,9 @@ void loop() {
         }
         nextActionTime = nowHM + MAX_REFILL_TIME; // maximum time for refilling!!!
         stateWatering = STATE_REFILL;
-        floatSensorCounter = 0;      //Set floatSensorCounter to 0 ready for calculations
-        floatSensorTime = millis();
-        sei();            //Enables interrupts
+        flowSensorCounter = 0;      //Set flowSensorCounter to 0 ready for calculations
+        flowSensorTime = millis();
+        interrupts();            //Enables interrupts
       }
       break;
     case STATE_IRRIGATE:
@@ -299,15 +300,15 @@ void loop() {
           logEvent_P(PSTR("Refill valve ON."), MSG_INFO);
 
           nextActionTime = nowHM + MAX_REFILL_TIME; // maximum time for refilling!!!
-          floatSensorCounter = 0;                   // Set floatSensorCounter to 0 ready for calculations
-          floatSensorTime = millis();
-          sei();                                    // Enables interrupts
+          flowSensorCounter = 0;                   // Set flowSensorCounter to 0 ready for calculations
+          flowSensorTime = millis();
+          interrupts();                                    // Enables interrupts
           stateWatering = STATE_REFILL;
         }
       }
       break;
     case STATE_REFILL:
-      floatSensorCounter = random(25, 100);
+      flowSensorCounter = random(25, 100);
       if (nowHM >= nextActionTime) {
         digitalWrite(PIN_REFILL_VALVE, LOW);
         logEvent_P(PSTR("Refill took too long."), MSG_ERROR);
@@ -320,8 +321,8 @@ void loop() {
         logEvent_P(PSTR("Refill valve OFF."), MSG_INFO);
 
         // --> evaluate amount of water filled to reservoir
-        cli(); // Deactivate interrupt
-        refilledWater = refilledWater + (float)floatSensorCounter * ML_PER_TICK;  // calculate final amount of water which was refilled to reservoir
+        noInterrupts(); // Deactivate interrupt
+        refilledWater = refilledWater + (float)flowSensorCounter * ML_PER_TICK;  // calculate final amount of water which was refilled to reservoir
         sprintf_P(msgBuffer, PSTR("%dml refilled."), (int)(refilledWater + .5));
         logEvent(msgBuffer, MSG_INFO);
 
@@ -338,22 +339,22 @@ void loop() {
 
         stateWatering = STATE_FERTILIZE;
       }
-      if (millis() - floatSensorTime > 1000) {
-        cli();
-        refilledWater = refilledWater + (float)floatSensorCounter * ML_PER_TICK;  // calculate intermediate amount of water which was refilled to reservoir
-        sprintf_P(msgBuffer, PSTR("Act: %d  - Cum: %d"), floatSensorCounter, (int)(refilledWater + .5));
+      if (millis() - flowSensorTime > 1000) {
+        noInterrupts();
+        refilledWater = refilledWater + (float)flowSensorCounter * ML_PER_TICK;  // calculate intermediate amount of water which was refilled to reservoir
+        sprintf_P(msgBuffer, PSTR("Act: %d  - Cum: %d"), flowSensorCounter, (int)(refilledWater + .5));
         logEvent(msgBuffer, MSG_INFO);
-        if (floatSensorCounter < 20) { // No water flow since 1 second
-          floatSensorErrorCounter++;   // Try some times
+        if (flowSensorCounter < 20) { // No water flow since 1 second
+          flowSensorErrorCounter++;   // Try some times
           logEvent_P(PSTR("No flow."), MSG_ERROR);
         }
-        floatSensorCounter = 0; // Reset floatSensorCounter
-        floatSensorTime = millis();
-        sei(); // Enable interrupt again
+        flowSensorCounter = 0; // Reset flowSensorCounter
+        flowSensorTime = millis();
+        interrupts(); // Enable interrupt again
       }
-      if (floatSensorErrorCounter > 5) { // Refill faild goto ERROR
-        floatSensorErrorCounter = 0;
-        floatSensorCounter = 0;
+      if (flowSensorErrorCounter > 5) { // Refill faild goto ERROR
+        flowSensorErrorCounter = 0;
+        flowSensorCounter = 0;
         logEvent_P(PSTR("No water flow detected during refill."), MSG_ERROR);
         stateWatering = STATE_ERROR;
         break;
@@ -392,21 +393,11 @@ void loop() {
   // execute every second
   if (millis() - timer1s >= 1000) {
     timer1s = millis();
+
+    cabinetTemperatureValue = sensors.getTempC(tempCabinet);
+    outsideTemperatureValue = sensors.getTempC(tempOutside);
+    reservoirTemperatureValue = sensors.getTempC(tempReservoir);
     sensors.requestTemperatures();
-    //if (sensors.isConnected(tempCabinet)) {
-    tempCabinetValue = sensors.getTempC(tempCabinet);
-    /*    }
-        else {
-          logEvent_P(PSTR("Cabinet Sensor not found."), MSG_ERROR);
-        }
-    */
-    tempOutsideValue = sensors.getTempC(tempOutside);
-    tempReservoirValue = sensors.getTempC(tempReservoir);
-
-    //tempCabinetValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
-    //tempOutsideValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
-    // tempReservoirValue = (float)(random(-10, 40) + (((float)random(0, 99)) / 100));
-
 #ifdef LCD
     // Switch LCD backlight off after BACKLIGHT_ON_TIME seconds
     if (backlightIsOn > 0) {
@@ -418,15 +409,16 @@ void loop() {
 #endif
   }
 
-  // Update log file name
-  if (hour() == 0 && minute() == 0 && second() == 0) {
-    logEvent_P(PSTR("Day over, creating new log file."), MSG_INFO);
-    setLogFileName();
-  }
-
   // Execute every RTC minute
   if (minute() != lastMinute && second() == 0) {
     lastMinute = minute();
+
+    // Update log file name
+    if (hour() == 0 && minute() == 0 && second() == 0) {
+      logEvent_P(PSTR("Day over, creating new log file."), MSG_INFO);
+      setLogFileName();
+    }
+
     if (minute() % sdLogIntervall == 0) {
       // do sensor logging
       msgBuffer[0] = '\0'; // Nullstring setzen
@@ -439,11 +431,15 @@ void loop() {
       strcat(msgBuffer, "\t");
       itoa(digitalRead(PIN_RESERVOIR_VERY_EMPTY), &msgBuffer[strlen(msgBuffer)], 10);
       strcat(msgBuffer, "\t");
-      dtostrf(tempCabinetValue, 0, 1, &msgBuffer[strlen(msgBuffer)]);
+      itoa(1, &msgBuffer[strlen(msgBuffer)], 10);
       strcat(msgBuffer, "\t");
-      dtostrf(tempOutsideValue, 0, 1, &msgBuffer[strlen(msgBuffer)]);
+      itoa(1, &msgBuffer[strlen(msgBuffer)], 10);
       strcat(msgBuffer, "\t");
-      dtostrf(tempReservoirValue, 0, 1, &msgBuffer[strlen(msgBuffer)]);
+      dtostrf(cabinetTemperatureValue, 0, 1, &msgBuffer[strlen(msgBuffer)]);
+      strcat(msgBuffer, "\t");
+      dtostrf(outsideTemperatureValue, 0, 1, &msgBuffer[strlen(msgBuffer)]);
+      strcat(msgBuffer, "\t");
+      dtostrf(reservoirTemperatureValue, 0, 1, &msgBuffer[strlen(msgBuffer)]);
       strcat(msgBuffer, "\t");
       strcat(msgBuffer, "600");
       strcat(msgBuffer, "\t");
@@ -473,6 +469,7 @@ void loop() {
     //sprintf(lcdText.row1, "%02d:%02d:%02d  %02d.%02d.%04d", hour(), minute(), second(), day(), month(), year());
 
   }
+
 }
 
 void setLogFileName() {
@@ -515,57 +512,94 @@ void CheckSerialManager() {
       if (serial_manager.getParam().length() > 0) {
         String value = serial_manager.getParam();
         Serial.println("");
-        if (value == "time" || value == "TIME") {
-          printHelp_time();
-        }
         if (value == "cat" || value == "CAT") {
-          printHelp_loginterval();
+          printHelpCat();
+          return;
+        }
+        if (value == "cfgflow" || value == "CFGFLOW") {
+          printHelpCfgflow();
+          return;
         }
         if (value == "cfgtmp" || value == "CFGTMP") {
-          printHelp_cfgtmp();
+          printHelpCfgtmp();
+          return;
         }
         if (value == "date" || value == "DATE") {
-          printHelp_date();
+          printHelpDate();
+          return;
         }
         if (value == "datetime" || value == "DATETIME") {
-          printHelp_datetime();
+          printHelpDatetime();
+          return;
         }
         if (value == "dir" || value == "DIR") {
-          printHelp_loginterval();
+          Serial.println(F("List files on storage media."));
+          return;
         }
         if (value == "drain" || value == "DRAIN") {
-          printHelp_loginterval();
+          printHelpDrain();
+          return;
         }
         if (value == "hwrst" || value == "HWRST") {
-          printHelp_loginterval();
+          Serial.println(F("Do a real HW reset. Use carefully!"));
+          return;
         }
-        if (value == "now" || value == "NOW") {
-          printHelp_loginterval();
+        if (value == "info" || value == "INFO") {
+          Serial.println(F("Show current status of controller."));
+          return;
         }
-        if (value == "ls" || value == "LS") {
-          printHelp_loginterval();
+        if (value == "list" || value == "LIST") {
+          Serial.println(F("List content of EEPROM."));
+          return;
         }
         if (value == "logint" || value == "LOGINT") {
-          printHelp_loginterval();
+          printHelpLoginterval();
+          return;
+        }
+        if (value == "ls" || value == "LS") {
+          Serial.println(F("List files on storage media."));
+          return;
+        }
+        if (value == "now" || value == "NOW") {
+          Serial.println(F("Print current date and time."));
+          return;
         }
         if (value == "nutcal" || value == "NUTCAL") {
-          printHelp_nutcal();
+          printHelpNutcal();
+          return;
         }
         if (value == "nutrient" || value == "NUTRIENT") {
-          printHelp_nutrient();
+          printHelpNutrient();
+          return;
+        }
+        if (value == "refill" || value == "REFILL") {
+          Serial.println(F("Trigger manual refill of reservoir."));
+          return;
         }
         if (value == "reset" || value == "RESET") {
-          printHelp_loginterval();
+          Serial.println(F("Set all parameters to default values."));
+          return;
+        }
+        if (value == "sdeject" || value == "SDEJECT") {
+          Serial.println(F("Disable SD card for save removal."));
+          return;
+        }
+        if (value == "sdinit" || value == "SDINIT") {
+          Serial.println(F("Re-initialise SD card."));
+          return;
         }
         if (value == "time" || value == "TIME") {
-          printHelp_time();
+          printHelpTime();
+          return;
         }
         if (value == "water" || value == "WATER") {
-          printHelp_water();
+          printHelpWater();
+          return;
         }
       }
       else {
         printHelp();
+        return;
       }
     }
 
@@ -583,7 +617,7 @@ void CheckSerialManager() {
       }
       else {
         // Print help
-        printHelp_time();
+        printHelpTime();
         printDateTime();
       }
     }
@@ -606,7 +640,7 @@ void CheckSerialManager() {
       }
       else {
         // Print help
-        printHelp_date();
+        printHelpDate();
         printDateTime();
       }
     }
@@ -624,7 +658,7 @@ void CheckSerialManager() {
       }
       else {
         // Print help
-        printHelp_datetime();
+        printHelpDatetime();
         printDateTime();
       }
     }
@@ -691,7 +725,7 @@ void CheckSerialManager() {
       }
       else {
         // Print help
-        printHelp_water();
+        printHelpWater();
         logParameters(LOG_WATERTIMERS, SERIAL_ONLY);
       }
     }
@@ -699,7 +733,7 @@ void CheckSerialManager() {
     // *** ERASE *********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("erase")) {
       for (int i = 0; i < EEPROM.length(); i++) {
-        EEPROM.write(i, 0xFF);
+        EEPROM.update(i, 0xFF);
       }
       serial_manager.println("OK");
     }
@@ -711,7 +745,7 @@ void CheckSerialManager() {
         if (value < 1 || value > 30) {
           value = 5;
         }
-        EEPROM.write(EEPROM_LOG_INTERVAL, (byte)value);
+        EEPROM.update(EEPROM_LOG_INTERVAL, (byte)value);
         sdLogIntervall = (byte)value;
         logEvent_P(PSTR("New log interval set."), MSG_INFO);
         logParameters(LOG_LOGINTERVAL);
@@ -719,50 +753,71 @@ void CheckSerialManager() {
 
       else {
         // Print help
-        printHelp_loginterval();
+        printHelpLoginterval();
         logParameters(LOG_LOGINTERVAL, SERIAL_ONLY);
       }
     }
 
-    // *** CAT *********************************************************************************************************************************************************************************************
 #ifdef SDCARD
+    // *** CAT *********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("cat") || serial_manager.isCmd("CAT")) {
       if (serial_manager.getParam().length() > 0) {
         char buf[14];
         serial_manager.getParam().toCharArray(buf, 13);
-        SdFile myOutputFile;
+        //SdFile myOutputFile;
         //file open
-        if (!myOutputFile.open(buf, O_READ)) {
+        if (!myFile.open(buf, O_READ)) {
           sprintf_P(msgBuffer, PSTR("Failed to open file %s"), buf);
           logEvent(msgBuffer, MSG_WARNING, SERIAL_ONLY);
+          return;
         }
         else {
           // read from the file until there's nothing else in it:
           int data;
           sprintf_P(msgBuffer, PSTR("********** Reading file: %s **********"), buf);
           Serial.println(msgBuffer);
-          while ((data = myOutputFile.read()) >= 0) {
+          while ((data = myFile.read()) >= 0) {
             Serial.write(data);
           }
           // close the file:
-          myOutputFile.close();
+          myFile.close();
           Serial.println(F("********** end file **********"));
         }
       }
+      else {
+        // Print help
+        printHelpCat();
+      }
     }
-#endif
 
     // *** DIR *********************************************************************************************************************************************************************************************
-#ifdef SDCARD
     if (serial_manager.isCmd("ls") || serial_manager.isCmd("dir") || serial_manager.isCmd("LS") || serial_manager.isCmd("DIR")) {
       Serial.println(F("List of files on the SD."));
       sd.ls(LS_R);
+    }
+
+    // *** SDEJECT **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("sdeject") || serial_manager.isCmd("SDEJECT")) {
+      sdEnabled = false;
+      logEvent_P(PSTR("SD card can now be removed safely."), MSG_WARNING);
+      // light LED
+    }
+
+    // *** SDINIT **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("sdinit") || serial_manager.isCmd("SDINIT")) {
+      if (!sd.begin(PIN_CHIP_SELECT, SPI_HALF_SPEED)) {
+        sd.initErrorPrint();
+      }
+      sdEnabled = true;
+      setLogFileName();
+      logEvent_P(PSTR("SD card has been re-initialised."), MSG_INFO);
+      //switch off led
     }
 #endif
 
     // *** LIST **********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("list")) {
-      eeprom_serial_dump_table(10);
+      EEPROMSerialDumpTable(10);
     }
 
     // *** REFILL **********************************************************************************************************************************************************************************************
@@ -777,29 +832,58 @@ void CheckSerialManager() {
         byte draintime = 0;
         String value = serial_manager.getParam();
         draintime = (byte)value.substring(0, value.length()).toInt();
-        EEPROM.write(EEPROM_DRAIN_TIME, draintime);
+        EEPROM.update(EEPROM_DRAIN_TIME, draintime);
         logEvent_P(PSTR("New drain time set."), MSG_INFO);
       }
       else {
         // Print help
-        logParameters(LOG_DRAINTIME, true);
+        printHelpDrain();
+        logParameters(LOG_DRAINTIME, SERIAL_ONLY);
+      }
+    }
+
+    // *** CFGFLOW **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("cfgflow") || serial_manager.isCmd("CFGFLOW")) {
+      if (serial_manager.getParam().length() > 0) {
+        unsigned int minFlowRate = 0;
+        String value = serial_manager.getParam();
+        minFlowRate = value.substring(0, value.length()).toInt();
+        EEPROMWriteInt(EEPROM_FLOW_SENSOR_MIN_PER_SECOND, minFlowRate);
+        logEvent_P(PSTR("Configuration of flow sensor alarm saved."), MSG_INFO);
+      }
+      else {
+        // Print help
+        printHelpCfgflow();
+        logParameters(LOG_CFGFLOW, SERIAL_ONLY);
       }
     }
 
     // *** INFO **********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("info") || serial_manager.isCmd("INFO")) {
       Serial.println(F("--------- status begin ---------"));
-      logParameters(LOG_PINSTATUS, true);
-      logParameters(LOG_WATERTIMERS, true);
-      logParameters(LOG_DRAINTIME, true);
-      logParameters(LOG_NUTRIENTS, true);
+      logParameters(LOG_ALL, SERIAL_ONLY);
       Serial.println(freeRam());
       Serial.println(F("---------- status end ----------"));
     }
 
-    // *** INFO **********************************************************************************************************************************************************************************************
+    // *** HWRST **********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("hwrst") || serial_manager.isCmd("HWRST")) {
       logEvent_P(PSTR("Manual HW RESET performed."), MSG_WARNING);
+      delay(200);
+      digitalWrite(PIN_HW_RESET, LOW);
+    }
+
+    // *** RESET **********************************************************************************************************************************************************************************************
+    if (serial_manager.isCmd("reset") || serial_manager.isCmd("RESET")) {
+      logEvent_P(PSTR("Resetting controller to default values!"), MSG_WARNING);
+
+      char myChar;
+      for (int i = 0; i < 50; i++)
+      {
+        myChar =  pgm_read_byte_near(EEPROMBackup + i);
+        EEPROM.update(i, myChar);
+      }
+      logEvent_P(PSTR("Automatic HW RESET performed."), MSG_WARNING);
       delay(200);
       digitalWrite(PIN_HW_RESET, LOW);
     }
@@ -815,13 +899,13 @@ void CheckSerialManager() {
         myDuration = value.substring(2, value.length()).toInt();
         if (channel >= 0 && channel <= 1 &&
             myDuration >= 0 && myDuration <= 255) {
-          EEPROM.write(EEPROM_NUTRIENT_TIMER + channel, myDuration);
+          EEPROM.update(EEPROM_NUTRIENT_TIMER + channel, myDuration);
           logParameters(LOG_NUTRIENTS);
         }
       }
       else {
         // Print help
-        printHelp_nutrient();
+        printHelpNutrient();
         logParameters(LOG_NUTRIENTS, SERIAL_ONLY);
       }
     }
@@ -837,36 +921,16 @@ void CheckSerialManager() {
         myValue = value.substring(2, value.length()).toInt();
         if (channel >= 0 && channel <= 1 &&
             myValue >= 0 && myValue <= 255) {
-          EEPROM.write(EEPROM_NUTRIENT_CALIBRATION + channel, myValue);
+          EEPROM.update(EEPROM_NUTRIENT_CALIBRATION + channel, myValue);
           logParameters(LOG_NUTRIENTS);
         }
       }
       else {
         // Print help
-        printHelp_nutcal();
+        printHelpNutcal();
         logParameters(LOG_NUTRIENTS, SERIAL_ONLY);
       }
     }
-
-#ifdef SDCARD
-    // *** CFGTMP **********************************************************************************************************************************************************************************************
-    if (serial_manager.isCmd("sdeject") || serial_manager.isCmd("SDEJECT")) {
-      sdEnabled = false;
-      logEvent_P(PSTR("SD card can now be removed safely."), MSG_WARNING);
-      // light LED
-    }
-
-    // *** CFGTMP **********************************************************************************************************************************************************************************************
-    if (serial_manager.isCmd("sdinit") || serial_manager.isCmd("SDINIT")) {
-      if (!sd.begin(PIN_CHIP_SELECT, SPI_HALF_SPEED)) {
-        sd.initErrorPrint();
-        sdEnabled = true;
-      }
-      setLogFileName();
-      logEvent_P(PSTR("SD card has been re-initialised."), MSG_INFO);
-      //switch off led
-    }
-#endif
 
     // *** CFGTMP **********************************************************************************************************************************************************************************************
     if (serial_manager.isCmd("cfgtmp") || serial_manager.isCmd("CFGTMP")) {
@@ -881,7 +945,7 @@ void CheckSerialManager() {
             for (int i = 0; i < 8; i++) {
               int n;
               n = (hexToByte(buf[2 + i * 3]) * 16) + hexToByte(buf[2 + i * 3 + 1]);
-              EEPROM.write(EEPROM_TEMP_CABINET + i, n);
+              EEPROM.update(EEPROM_TEMP_CABINET + i, n);
               tempCabinet[i] = n;
             }
             logEvent_P(PSTR("OW Sensor adress changed for sensor CABINET."), MSG_INFO);
@@ -890,7 +954,7 @@ void CheckSerialManager() {
             for (int i = 0; i < 8; i++) {
               int n;
               n = (hexToByte(buf[2 + i * 3]) * 16) + hexToByte(buf[2 + i * 3 + 1]);
-              EEPROM.write(EEPROM_TEMP_OUTSIDE + i, n);
+              EEPROM.update(EEPROM_TEMP_OUTSIDE + i, n);
               tempOutside[i] = n;
             }
             logEvent_P(PSTR("OW Sensor adress changed for sensor OUTSIDE."), MSG_INFO);
@@ -899,7 +963,7 @@ void CheckSerialManager() {
             for (int i = 0; i < 8; i++) {
               int n;
               n = (hexToByte(buf[2 + i * 3]) * 16) + hexToByte(buf[2 + i * 3 + 1]);
-              EEPROM.write(EEPROM_TEMP_RESERVOIR + i, n);
+              EEPROM.update(EEPROM_TEMP_RESERVOIR + i, n);
               tempReservoir[i] = n;
             }
             logEvent_P(PSTR("OW Sensor adress changed for sensor RESERVOIR."), MSG_INFO);
@@ -908,9 +972,9 @@ void CheckSerialManager() {
             break;
         }
       } else {
-        printHelp_cfgtmp();
+        printHelpCfgtmp();
         // print configured sensor adresses + status
-        Serial.print(F("Sensor Cabinet (ID: 0)  : "));
+        Serial.print(F("Sensor Cabinet   (ID: 0): "));
         printOwAddress(tempCabinet);
         if (sensors.isConnected(tempCabinet)) {
           Serial.print(F(" OK"));
@@ -919,7 +983,7 @@ void CheckSerialManager() {
         }
         Serial.println("");
 
-        Serial.print(F("Sensor Outside (ID: 1)  : "));
+        Serial.print(F("Sensor Outside   (ID: 1): "));
         printOwAddress(tempOutside);
         if (sensors.isConnected(tempOutside)) {
           Serial.print(F(" OK"));
@@ -1001,7 +1065,8 @@ void printHelp() {
   Serial.println(F("Enter HELP \"command name\" to get detailled information about a command."));
   Serial.println("");
   Serial.println(F("cat        Show content of a file."));
-  Serial.println(F("cfgtmp     Configure HW adresses of temperature sensors.."));
+  Serial.println(F("cfgtmp     Configure HW adresses of temperature sensors."));
+  Serial.println(F("cfgflow    Configure the minimum flow per second for refilling the reservoir."));
   Serial.println(F("date       Show or set current date."));
   Serial.println(F("datetime   Show or set current date and time."));
   Serial.println(F("dir        List files on storage media."));
@@ -1021,47 +1086,60 @@ void printHelp() {
   Serial.println(F("time       Show or set current time."));
   Serial.println(F("water      List or edit configured timers for irrigation."));
 }
-
-void printHelp_time() {
-  Serial.println(F("Set time of RTC:"));
+void printHelpTime() {
+  Serial.println(F("Set time of RTC."));
   Serial.println(F("   time"));
   Serial.println(F("   time <hh>:<mm>:<ss>"));
 }
-void printHelp_date() {
-  Serial.println(F("Set date of RTC:"));
+void printHelpDate() {
+  Serial.println(F("Set date of RTC."));
   Serial.println(F("   date"));
   Serial.println(F("   date <dd>.<mm>.<yyyy>"));
 }
-void printHelp_datetime() {
-  Serial.println(F("Set date and time of RTC:"));
+void printHelpDatetime() {
+  Serial.println(F("Set date and time of RTC."));
   Serial.println(F("   datetime"));
   Serial.println(F("   datetime <dd>.<mm>.<yyyy> <hh>:<mm>:<ss>"));
 }
-void printHelp_water() {
-  Serial.println(F("Create, change or delete a water timer:"));
+void printHelpWater() {
+  Serial.println(F("Create, change or delete a water timer."));
   Serial.println(F("   water"));
   Serial.println(F("   water <0...8> <hh>:<mm> <0... 255 minutes runtime>"));
   Serial.println(F("   water <0...8> del"));
 }
-void printHelp_nutrient() {
-  Serial.println(F("Configure amount of fertilizer to be added after refill:>"));
+void printHelpNutrient() {
+  Serial.println(F("Configure amount of fertilizer to be added after refill."));
   Serial.println(F("   nutrient"));
   Serial.println(F("   nutrient <0...1> <0... 255 ml per 100ml fresh water>"));
 }
-void printHelp_nutcal() {
-  Serial.println(F("Set calibration value of dosing pump:"));
+void printHelpNutcal() {
+  Serial.println(F("Set calibration value of dosing pump."));
   Serial.println(F("   nutcal"));
   Serial.println(F("   nutcal <0...1> <0... 255 seconds per ml>"));
 }
-void printHelp_loginterval() {
-  Serial.println(F("Set interval for logging data to SD card:"));
+void printHelpLoginterval() {
+  Serial.println(F("Set interval for logging data to SD card."));
   Serial.println(F("   loginterval"));
   Serial.println(F("   loginterval <1...30 minutes>"));
 }
-void printHelp_cfgtmp() {
-  Serial.println(F("Configure temperature sensor hw adresses:"));
+void printHelpDrain() {
+  Serial.println(F("Set drain time to allow water returning to the reservoir after irrigation."));
+  Serial.println(F("   drain"));
+  Serial.println(F("   drain <0...255 minutes>"));
+}
+void printHelpCat() {
+  Serial.println(F("Display the content of a file. Use ls or dir to list files on the SD card."));
+  Serial.println(F("   cat <filename>"));
+}
+void printHelpCfgtmp() {
+  Serial.println(F("Configure temperature sensor hw adresses."));
   Serial.println(F("   cfgtmp"));
   Serial.println(F("   cfgtmp <0...2 which sensor> <FF FF FF FF FF FF FF FF>"));
+}
+void printHelpCfgflow() {
+  Serial.println(F("Configure the minimum flow required for refilling the reservoir."));
+  Serial.println(F("   cfgflow"));
+  Serial.println(F("   cfgflow <1...65000 ticks per second>"));
 }
 void printDateTime() {
   char localBuffer[25]; // "Now: 00.00.0000 00:00:00"
@@ -1123,30 +1201,13 @@ void logEvent(const char *data, byte msgType, boolean serialOnly) {
   Serial.println(localBuffer);
 }
 
-void logToSd(char *localBuffer) {
-#ifdef SDCARD
-  if (sdEnabled == true) {
-    // open the file for write at end like the Native SD library
-    if (!myFile.open(logFileName, O_RDWR | O_CREAT | O_AT_END)) {
-      sd.errorPrint(F("opening file faild."));
-    }
-    else {
-      // if the file opened okay, write to it:
-      myFile.println(localBuffer);
-
-      // close the file:
-      myFile.close();
-    }
-  }
-#endif
-}
-
 void logParameters(byte whatToLog, boolean serialOnly) {
   char localBuffer[65];// = "Timer 0: Start: 00:00 End: 00:00 Duration: 000 min (eepromID: 0)";
   unsigned int localStartTime;
   unsigned int localEndTime;
 
   if (whatToLog == LOG_WATERTIMERS || whatToLog == LOG_ALL) {
+    Serial.println(F("********** Water timers **********"));
     sprintf_P(localBuffer, PSTR("%02d:%02d:%02d\tINFO\tWater Timers:"), hour(), minute(), second());
     Serial.println(localBuffer);
     for (int i = 0; i < MAX_WATER_TIMERS; i++) {
@@ -1169,6 +1230,7 @@ void logParameters(byte whatToLog, boolean serialOnly) {
     }
   }
   if (whatToLog == LOG_NUTRIENTS || whatToLog == LOG_ALL) {
+    Serial.println(F("************ Nutrients ***********"));
     for (int i = 0; i < 2; i++) {
       sprintf_P(localBuffer, PSTR("%02d:%02d:%02d\tINFO\tNutrient calibration\t%d\t%d\ts/ml"), hour(), minute(), second(), i, EEPROM.read(EEPROM_NUTRIENT_CALIBRATION + i));
       if (!serialOnly) {
@@ -1185,6 +1247,7 @@ void logParameters(byte whatToLog, boolean serialOnly) {
     }
   }
   if (whatToLog == LOG_DRAINTIME || whatToLog == LOG_ALL) {
+    Serial.println(F("************ Drain time **********"));
     sprintf_P(localBuffer, PSTR("%02d:%02d:%02d\tINFO\tDrain time\t%d\tmin"), hour(), minute(), second(), EEPROM.read(EEPROM_DRAIN_TIME));
     if (!serialOnly) {
       logToSd(localBuffer);
@@ -1193,14 +1256,23 @@ void logParameters(byte whatToLog, boolean serialOnly) {
   }
 
   if (whatToLog == LOG_LOGINTERVAL || whatToLog == LOG_ALL) {
+    Serial.println(F("*********** Log interval *********"));
     sprintf_P(localBuffer, PSTR("%02d:%02d:%02d\tINFO\tLog interval\t%d\tmin"), hour(), minute(), second(), EEPROM.read(EEPROM_LOG_INTERVAL));
     if (!serialOnly) {
       logToSd(localBuffer);
     }
     Serial.println(localBuffer);
   }
+  if (whatToLog == LOG_CFGFLOW || whatToLog == LOG_ALL) {
+    Serial.println(F("********** Min flow rate *********"));
+    sprintf_P(localBuffer, PSTR("%02d:%02d:%02d\tINFO\tMin flow rate\t%d\tticks per second"), hour(), minute(), second(), EEPROMReadInt(EEPROM_FLOW_SENSOR_MIN_PER_SECOND));
+    if (!serialOnly) {
+      logToSd(localBuffer);
+    }
+    Serial.println(localBuffer);
+  }
   if (whatToLog == LOG_PINSTATUS || whatToLog == LOG_ALL) {
-
+    Serial.println(F("*************** FSM **************"));
     Serial.print(F("FSM state:            "));
     switch (stateWatering) {
       case STATE_IDLE:
@@ -1226,6 +1298,55 @@ void logParameters(byte whatToLog, boolean serialOnly) {
         Serial.println(stateWatering);
         break;
     }
+    Serial.println(F("********** SD Card State *********"));
+    uint32_t cardSize;
+    cardSize = sd.card()->cardSize();
+
+    cid_t cid;
+    if (!sd.card()->readCID(&cid)) {
+      Serial.print(F("readCID failed"));
+    }
+    else {
+      Serial.print(F("\nManufacturer ID: "));
+      Serial.println(int(cid.mid));
+      Serial.print(F("OEM ID: "));
+      Serial.print(cid.oid[0]);
+      Serial.println(cid.oid[1]);
+      Serial.print(F("Product: "));
+      for (uint8_t i = 0; i < 5; i++) {
+        Serial.print(cid.pnm[i]);
+      }
+      Serial.println("");
+      Serial.print(F("Version: "));
+      Serial.print(int(cid.prv_n), HEX);
+      Serial.print('.');
+      Serial.println(int(cid.prv_m));
+      Serial.print(F("Serial number: "));
+      Serial.println(cid.psn, HEX);
+      Serial.print(F("Manufacturing date: "));
+      Serial.print(int(cid.mdt_month));
+      Serial.print('/');
+      Serial.println((2000 + cid.mdt_year_low + 10 * cid.mdt_year_high));
+    }
+    Serial.print(F("\nVolume is FAT"));
+    Serial.println(int(sd.vol()->fatType()));
+    Serial.print(F("Card Size:  "));
+    float cs;
+    cs = cardSize * 0.000512F;
+    Serial.print((int)cs);
+    Serial.print(",");
+    Serial.print((int)(cs * 100.0F) % 100);
+    Serial.println(F(" MB (MB = 1,000,000 bytes)"));
+
+    float fs;
+    fs = 0.000512 * sd.vol()->freeClusterCount() * sd.vol()->blocksPerCluster();
+    Serial.print(F("Free Space: "));
+    Serial.print((int)fs);
+    Serial.print(",");
+    Serial.print((int)(fs * 100.0F) % 100);
+    Serial.println(F(" MB (MB = 1,000,000 bytes)"));
+
+    Serial.println(F("********** Output States *********"));
     Serial.print(F("Irrigation pump:      "));
     Serial.print(digitalRead(PIN_IRRIGATION));
     Serial.println("");
@@ -1235,6 +1356,11 @@ void logParameters(byte whatToLog, boolean serialOnly) {
     Serial.print(F("Nutrient pump 2:      "));
     Serial.print(digitalRead(PIN_NUTRIENT_2));
     Serial.println("");
+    Serial.print(F("Refill valve:         "));
+    Serial.print(digitalRead(PIN_REFILL_VALVE));
+    Serial.println("");
+
+    Serial.println(F("********** Input States **********"));
     Serial.print(F("Reservoir VERY_FULL:  "));
     Serial.print(digitalRead(PIN_RESERVOIR_VERY_FULL));
     Serial.println("");
@@ -1247,27 +1373,74 @@ void logParameters(byte whatToLog, boolean serialOnly) {
     Serial.print(F("Reservoir VERY_EMPTY: "));
     Serial.print(digitalRead(PIN_RESERVOIR_VERY_EMPTY));
     Serial.println("");
-    Serial.print(F("Refill valve:         "));
-    Serial.print(digitalRead(PIN_REFILL_VALVE));
-    Serial.println("");
-    Serial.print(F("Temp. reservoir:      "));
-    Serial.print(20.3);
-    Serial.println(" °C");
-    Serial.print(F("Temp. outside:        "));
-    Serial.print(30.1);
-    Serial.println(" °C");
-    Serial.print(F("Temp. cabinet:        "));
-    Serial.print((int)tempCabinetValue);
-    Serial.print(",");
-    Serial.print((int)(tempCabinetValue * 10.0F) % 10);
-    Serial.println(" °C");
 
+    Serial.print(F("Nutrient Solution 1:  "));
+    Serial.print("EMPTY");
+    Serial.println("");
+    Serial.print(F("Nutrient Solution 2:  "));
+    Serial.print("EMPTY");
+    Serial.println("");
+
+    Serial.println(F("********** Temperatures **********"));
+    Serial.print(F("Temperature Cabinet ("));
+    printOwAddress(tempCabinet);
+    Serial.print(F("):     "));
+    Serial.print((int)cabinetTemperatureValue);
+    Serial.print(",");
+    Serial.print((int)(cabinetTemperatureValue * 10.0F) % 10);
+    Serial.print(" ");
+    Serial.print((char)176);
+    Serial.println("C");
+
+    Serial.print(F("Temperature Outside ("));
+    printOwAddress(tempOutside);
+    Serial.print(F("):     "));
+    Serial.print((int)outsideTemperatureValue);
+    Serial.print(",");
+    Serial.print((int)(outsideTemperatureValue * 10.0F) % 10);
+    Serial.print(" ");
+    Serial.print((char)176);
+    Serial.println("C");
+
+    Serial.print(F("Temperature Outside ("));
+    printOwAddress(tempReservoir);
+    Serial.print(F("):     "));
+    Serial.print((int)reservoirTemperatureValue);
+    Serial.print(",");
+    Serial.print((int)(reservoirTemperatureValue * 10.0F) % 10);
+    Serial.print(" ");
+    Serial.print((char)176);
+    Serial.println("C");
   }
 }
 
+void logToSd(char *localBuffer) {
+#ifdef SDCARD
+  if (sdEnabled == true) {
+    // open the file for write at end like the Native SD library
+    if (!myFile.open(logFileName, O_RDWR | O_CREAT | O_AT_END)) {
+      sd.errorPrint(F("opening file faild."));
+    }
+    else {
+      // if the file opened okay, write to it:
+      myFile.println(localBuffer);
 
-void interruptRoutineFloatSensorCounter() {
-  floatSensorCounter++;
+      // close the file:
+      myFile.close();
+    }
+  }
+#endif
+}
+
+
+void readOwArdessesFromEeprom(uint8_t* myDeviceAddress, int eepromStartAddress) {
+  for (int i = 0; i < 8; i++) {
+    myDeviceAddress[i] = EEPROM.read(eepromStartAddress + i);
+  }
+}
+
+void interruptRoutineFlowSensorCounter() {
+  flowSensorCounter++;
 }
 
 /* qsort struct comparision function (hour * 60 + minutes field) */
@@ -1288,8 +1461,24 @@ void sortWaterTimers() {
   qsort(irrigationAlarms, structs_len, sizeof(struct timer_t), struct_cmp_timer);
 }
 
+//This function will write a 2 byte integer to the eeprom at the specified address and address + 1
+void EEPROMWriteInt(int p_address, int p_value) {
+  byte lowByte = ((p_value >> 0) & 0xFF);
+  byte highByte = ((p_value >> 8) & 0xFF);
 
-void eeprom_serial_dump_table(int bytesPerRow) {
+  EEPROM.update(p_address, lowByte);
+  EEPROM.update(p_address + 1, highByte);
+}
+
+//This function will read a 2 byte integer from the eeprom at the specified address and address + 1
+unsigned int EEPROMReadInt(int p_address) {
+  byte lowByte = EEPROM.read(p_address);
+  byte highByte = EEPROM.read(p_address + 1);
+
+  return ((lowByte << 0) & 0xFF) + ((highByte << 8) & 0xFF00);
+}
+
+void EEPROMSerialDumpTable(int bytesPerRow) {
   // address counter
   int i;
 
@@ -1307,7 +1496,7 @@ void eeprom_serial_dump_table(int bytesPerRow) {
   j = 0;
 
   // go from first to last eeprom address
-  for (i = 0; i <= 100; i++) {
+  for (i = 0; i < 100; i++) {
 
     // if this is the first byte of the row,
     // start row by printing the byte address
