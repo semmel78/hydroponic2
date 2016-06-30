@@ -382,6 +382,7 @@ void loop() {
       break;
     case STATE_ERROR:
       //send sms
+      logEvent_P(PSTR("I am in state ERROR."), MSG_ERROR);
       break;
     default:
       // something went wrong
